@@ -1,0 +1,32 @@
+# configs/env/atari.yaml
+# 标准Atari训练配置，对应JAX版本的atari设置
+
+task: atari_breakout
+steps: 5.1e6
+env_num: 1
+eval_episode_num: 10
+action_repeat: 4
+train_ratio: 32
+time_limit: 108000
+
+seed: ${seed}
+device: ${device}
+
+size: [64, 64]
+encoder:
+  mlp_keys: '$^'
+  cnn_keys: 'image'
+decoder:
+  mlp_keys: '$^'
+  cnn_keys: 'image'
+
+gray: True
+noops: 30
+lives: unused
+sticky: True
+actions: all
+pooling: 2
+aggregate: max
+resize: pillow
+autostart: False
+clip_reward: False
