@@ -5,6 +5,9 @@ import tools
 
 class OnlineTrainer:
     def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs):
+        # 在__init__里加，save_every控制多久保存一次
+        self._should_save = tools.Every(config.save_every if hasattr(config, 'save_every') else 1e4)
+        self._logdir = logdir  # 需要知道保存路径
         self.replay_buffer = replay_buffer
         self.logger = logger
         self.train_envs = train_envs
@@ -123,6 +126,15 @@ class OnlineTrainer:
             # Evaluation
             if self._should_eval(step) and self.eval_episode_num > 0:
                 self.eval(agent, step)
+            # 放在eval判断的下面    
+            if self._should_save(step):
+                items_to_save = {
+                    "agent_state_dict": agent.state_dict(),
+                    "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+                    "step": step,
+                    }
+                torch.save(items_to_save, self._logdir / "latest.pt")
+                print(f"Checkpoint saved at step {step}")
             # Save metrics
             if done.any():
                 for i, d in enumerate(done):

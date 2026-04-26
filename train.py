@@ -48,6 +48,19 @@ def main(config):
         act_space,
     ).to(config.device)
 
+    checkpoint_path = logdir / "latest.pt"
+    if checkpoint_path.exists():
+        print(f"Resuming from checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=config.device)
+        agent.load_state_dict(checkpoint["agent_state_dict"])
+        tools.recursively_load_optim_state_dict(
+            agent, checkpoint["optims_state_dict"]
+        )
+        resumed_step = checkpoint.get("step", 0)
+        print(f"Resumed from step {resumed_step}")
+    else:
+        print("No checkpoint found, starting from scratch.")
+
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
     policy_trainer.begin(agent)
 
