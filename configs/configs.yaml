@@ -36,3 +36,4 @@ trainer:
   params_hist_log: False
   update_log_every: 5e3
   action_repeat: ${env.action_repeat}
+  save_every: 5e4
