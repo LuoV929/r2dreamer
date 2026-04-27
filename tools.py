@@ -159,6 +159,8 @@ class Logger:
                 value = np.clip(255 * value, 0, 255).astype(np.uint8)
             B, T, H, W, C = value.shape
             value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
+            if value.shape[-3] == 1:  # 如果是单通道图像
+                value = value.repeat(1, 1, 3, 1, 1) if value.dim() == 5 else value.repeat(1, 3, 1, 1)
             self._writer.add_video(name, value, step, 16)
         for name, value in self._histograms.items():
             self._writer.add_histogram(name, value, step)
