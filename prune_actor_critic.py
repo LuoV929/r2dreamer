@@ -40,6 +40,7 @@ HYDRA_OVERRIDES = [
     "model.rep_loss=dreamer",
     "model.compile=False",
     "device=cuda:0",
+    "buffer.storage_device=cpu",
 ]
 
 

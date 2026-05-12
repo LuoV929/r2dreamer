@@ -22,7 +22,8 @@ buffer:
   batch_length: ${batch_length}
   max_size: 5e5
   device: ${device}
-  storage_device: 'cuda:0'
+  # Replay tensors live here; use cpu to save VRAM (sampling still moves batches to ${device}).
+  storage_device: 'cpu'
 
 trainer:
   steps: ${env.steps}
