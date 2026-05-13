@@ -126,12 +126,11 @@ def collect_data_and_compute_importance(agent: Dreamer, cfg, train_envs):
     return importance
 
 
-def _group_index_for_linear0(dg: tp.DependencyGraph, name_substr: str) -> int:
-    """在 get_all_groups() 里找到与「第一层隐藏 Linear」对应的组。
+def _group_index_for_linear(dg: tp.DependencyGraph, name_substr: str) -> int:
+    """在 ``get_all_groups()`` 中找到 ``str(group)`` 含 ``name_substr`` 的组索引。
 
-    对多层 MLP+last，`groups[1]` 往往靠近输出侧（会先剪到 linear2），与 Hydra 里
-    单一的 ``units``（各隐藏层同宽）矛盾。这里改为匹配名字里含 ``*_linear0`` 的组；
-    若多个命中，取最后一个（通常对应最靠前的 Linear 输出通道组）。
+    多层 MLP 中 ``groups[1]`` 往往对应靠近输出的通道，不能写死。对 ``actor_linear{i}``、
+    ``value_linear{i}`` 分别建图后匹配；多命中时取 ``hits[-1]``（与此前 linear0 经验一致）。
     """
     groups = list(dg.get_all_groups())
     hits = [i for i, g in enumerate(groups) if name_substr in str(g)]
@@ -141,6 +140,10 @@ def _group_index_for_linear0(dg: tp.DependencyGraph, name_substr: str) -> int:
     return hits[-1]
 
 
+def _count_mlp_linears(mlp: nn.Module) -> int:
+    return sum(1 for m in mlp.layers if isinstance(m, nn.Linear))
+
+
 def _assert_uniform_mlp_linears(mlp: nn.Module, tag: str) -> int:
     """Dreamer 的 MLP 各隐藏层共用同一 ``units``；剪枝后所有 Linear 的 out_features 须一致。"""
     linears = [m for m in mlp.layers if isinstance(m, nn.Linear)]
@@ -148,7 +151,7 @@ def _assert_uniform_mlp_linears(mlp: nn.Module, tag: str) -> int:
     if len(set(outs)) != 1:
         raise RuntimeError(
             f"{tag}: 剪枝后各 Linear 输出维不一致 {outs}，无法用单一 cfg.actor/critic.units 加载。"
-            "请确认已用「linear0 对应依赖组」剪枝。"
+            "应对 actor_linear0..2（及 value）逐层用同一 pruning_idxs 剪输出通道组。"
         )
     return outs[0]
 
@@ -161,11 +164,7 @@ def _prune_mlp_head_pair(
     label: str,
     group_name_substr: str,
 ):
-    """对 (mlp+last) 与 frozen 副本用同一组 idxs，在含 ``*_linear0`` 的依赖组上剪枝。
-
-    torch_pruning 对「全部为 requires_grad=False」的子图（如 _slow_value）建图时
-    可能只得到 1 个依赖组；建图前临时打开梯度标志，剪完再恢复。
-    """
+    """在含 ``group_name_substr``（如 ``actor_linear1``）的依赖组上剪枝；live / frozen 各剪一次。"""
     live_rg = [p.requires_grad for p in live_mlp_last.parameters()]
     frozen_rg = [p.requires_grad for p in frozen_mlp_last.parameters()]
     for p in live_mlp_last.parameters():
@@ -182,8 +181,8 @@ def _prune_mlp_head_pair(
         groups = list(dg.get_all_groups())
         if len(groups) < 2:
             raise RuntimeError(f"{label}: 依赖组不足 2 个，当前 len={len(groups)}")
-        gi = _group_index_for_linear0(dg, group_name_substr)
-        print(f"    [{label}] 使用依赖组 index={gi} (匹配 {group_name_substr!r})")
+        gi = _group_index_for_linear(dg, group_name_substr)
+        print(f"    [{label}] 依赖组 index={gi} (匹配 {group_name_substr!r})")
         groups[gi].prune(idxs=pruning_idxs)
 
         dg_f = tp.DependencyGraph()
@@ -195,13 +194,47 @@ def _prune_mlp_head_pair(
         groups_f = list(dg_f.get_all_groups())
         if len(groups_f) < 2:
             raise RuntimeError(f"{label} (frozen): 依赖组不足 2 个")
-        gi_f = _group_index_for_linear0(dg_f, group_name_substr)
+        gi_f = _group_index_for_linear(dg_f, group_name_substr)
         groups_f[gi_f].prune(idxs=pruning_idxs)
     finally:
         for p, r in zip(live_mlp_last.parameters(), live_rg):
             p.requires_grad_(r)
         for p, r in zip(frozen_mlp_last.parameters(), frozen_rg):
             p.requires_grad_(r)
+
+
+def _prune_all_heads_same_idxs(agent: Dreamer, dummy_feat: torch.Tensor, pruning_idxs: list[int]) -> None:
+    """对 Actor / Value / _slow 的每一层隐藏 Linear，用同一 ``pruning_idxs`` 剪输出通道（与单一 ``units`` 一致）。"""
+    n_a = _count_mlp_linears(agent.actor.mlp)
+    n_v = _count_mlp_linears(agent.value.mlp)
+    n_s = _count_mlp_linears(agent._slow_value.mlp)
+    if not (n_a == n_v == n_s):
+        raise RuntimeError(f"Actor / Value / _slow_value 的 MLP 层数不一致: {n_a}, {n_v}, {n_s}")
+    for li in range(n_a):
+        _prune_mlp_head_pair(
+            nn.Sequential(agent.actor.mlp, agent.actor.last),
+            nn.Sequential(agent._frozen_actor.mlp, agent._frozen_actor.last),
+            dummy_feat,
+            pruning_idxs,
+            f"actor_L{li}",
+            f"actor_linear{li}",
+        )
+        _prune_mlp_head_pair(
+            nn.Sequential(agent.value.mlp, agent.value.last),
+            nn.Sequential(agent._frozen_value.mlp, agent._frozen_value.last),
+            dummy_feat,
+            pruning_idxs,
+            f"value_L{li}",
+            f"value_linear{li}",
+        )
+        _prune_mlp_head_pair(
+            nn.Sequential(agent._slow_value.mlp, agent._slow_value.last),
+            nn.Sequential(agent._frozen_slow_value.mlp, agent._frozen_slow_value.last),
+            dummy_feat,
+            pruning_idxs,
+            f"_slow_L{li}",
+            f"value_linear{li}",
+        )
 
 
 def prune_actor_critic(agent: Dreamer, importance: torch.Tensor, prune_ratio: float) -> Dreamer:
@@ -219,30 +252,7 @@ def prune_actor_critic(agent: Dreamer, importance: torch.Tensor, prune_ratio: fl
     feat_size = agent.rssm.feat_size
     dummy_feat = torch.zeros(1, feat_size, device=agent.device)
 
-    _prune_mlp_head_pair(
-        nn.Sequential(agent.actor.mlp, agent.actor.last),
-        nn.Sequential(agent._frozen_actor.mlp, agent._frozen_actor.last),
-        dummy_feat,
-        pruning_idxs,
-        "actor",
-        "actor_linear0",
-    )
-    _prune_mlp_head_pair(
-        nn.Sequential(agent.value.mlp, agent.value.last),
-        nn.Sequential(agent._frozen_value.mlp, agent._frozen_value.last),
-        dummy_feat,
-        pruning_idxs,
-        "value",
-        "value_linear0",
-    )
-    _prune_mlp_head_pair(
-        nn.Sequential(agent._slow_value.mlp, agent._slow_value.last),
-        nn.Sequential(agent._frozen_slow_value.mlp, agent._frozen_slow_value.last),
-        dummy_feat,
-        pruning_idxs,
-        "_slow_value",
-        "value_linear0",
-    )
+    _prune_all_heads_same_idxs(agent, dummy_feat, pruning_idxs)
 
     ua = _assert_uniform_mlp_linears(agent.actor.mlp, "actor.mlp")
     uv = _assert_uniform_mlp_linears(agent.value.mlp, "value.mlp")
