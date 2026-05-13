@@ -249,7 +249,8 @@ def main():
     train_envs, eval_envs, obs_space, act_space = make_envs(cfg.env)
 
     # prune_ratios = [0.3, 0.5, 0.7]
-    prune_ratios = [0.55, 0.6, 0.65]
+    # prune_ratios = [0.55, 0.6, 0.65]
+    prune_ratios = [0.75, 0.8]
 
     for prune_ratio in prune_ratios:
         print(f"\n{'=' * 60}\n剪枝率: {prune_ratio * 100:.0f}%\n{'=' * 60}")
