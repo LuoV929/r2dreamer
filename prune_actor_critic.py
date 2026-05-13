@@ -1,8 +1,8 @@
 # prune_actor_critic.py
-# Taylor 一阶重要性（合并 Actor / Value 第一层隐藏神经元），结构化剪枝 + 同步剪枝
-# frozen / slow 副本，保存剪枝模型。路径请按 Colab / 本机修改。
+# Taylor 一阶重要性（合并 Actor / Value 的 linear0），按同一组神经元索引做
+# 「结构化宽度剪枝」：各隐藏层与 RMSNorm、last 同步缩维，与 Hydra 单一 units 一致。
 #
-# 依赖: torch_pruning, hydra, omegaconf；与 prune_reward 流程一致。
+# 依赖: hydra, omegaconf（不再用 torch_pruning 做多层剪枝，避免依赖组索引不稳定）。
 
 from __future__ import annotations
 
@@ -16,14 +16,12 @@ if str(_REPO) not in sys.path:
 
 import torch
 import torch.nn as nn
-import torch_pruning as tp
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 from buffer import Buffer
 from dreamer import Dreamer
 from envs import make_envs
-from pruning_utils import RMSNormPruningHandler
 
 # ================================================================
 # 路径与 Hydra（Colab 改这里；本机若目录不存在会在 __main__ 回落到 _REPO）
@@ -43,8 +41,6 @@ HYDRA_OVERRIDES = [
     "buffer.storage_device=cpu",
 ]
 
-# 重要性估计：单独 (B,T)，避免 _cal_grad 反传 OOM。仍用完整损失图，仅缩小 slice。
-# 若仍 OOM，改为 (2, 8) 或 (4, 8)，或减小 CALIB_N_BATCHES。
 CALIB_BATCH_SIZE = 4
 CALIB_BATCH_LENGTH = 16
 CALIB_N_BATCHES = 16
@@ -56,7 +52,7 @@ def _build_cfg():
 
 
 def collect_data_and_compute_importance(agent: Dreamer, cfg, train_envs):
-    """小 buffer 采数据；用缩小的 (B,T) 多次 _cal_grad 累积梯度，降低单次反传显存。"""
+    """小 buffer；缩小 (B,T) 多次 _cal_grad 累积梯度。"""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -126,119 +122,78 @@ def collect_data_and_compute_importance(agent: Dreamer, cfg, train_envs):
     return importance
 
 
-def _group_index_for_linear(dg: tp.DependencyGraph, name_substr: str) -> int:
-    """在 ``get_all_groups()`` 中找到 ``str(group)`` 含 ``name_substr`` 的组索引。
+def _list_mlp_linears_in_order(mlp: nn.Module) -> list[tuple[str, nn.Linear]]:
+    pairs = [(n, m) for n, m in mlp.layers.named_children() if isinstance(m, nn.Linear)]
+    pairs.sort(key=lambda nm: int(nm[0].split("linear")[-1]))
+    return pairs
 
-    多层 MLP 中 ``groups[1]`` 往往对应靠近输出的通道，不能写死。对 ``actor_linear{i}``、
-    ``value_linear{i}`` 分别建图后匹配；多命中时取 ``hits[-1]``（与此前 linear0 经验一致）。
+
+def _manual_neuron_prune_mlp_and_last(
+    mlp: nn.Module,
+    last: nn.Linear,
+    prune_idxs: list[int],
+) -> None:
+    """按神经元索引 ``prune_idxs`` 从各隐藏层同步删掉通道，保持各层 out 维一致。
+
+    约定：各 ``*_linear*`` 的 out_features 原为同一 ``units``；``prune_idxs`` 为要删的
+    输出通道下标（与 Taylor 在 linear0 上的打分一致）。
     """
-    groups = list(dg.get_all_groups())
-    hits = [i for i, g in enumerate(groups) if name_substr in str(g)]
-    if not hits:
-        preview = "\n".join(f"  [{i}] {str(g)[:240]}" for i, g in enumerate(groups))
-        raise RuntimeError(f"依赖图中找不到含 {name_substr!r} 的组。当前组:\n{preview}")
-    return hits[-1]
+    rm = {int(i) for i in prune_idxs}
+    linears = _list_mlp_linears_in_order(mlp)
+    if not linears:
+        raise RuntimeError("MLP 中未找到 Linear")
+
+    d0 = linears[0][1].out_features
+    keep_list = [i for i in range(d0) if i not in rm]
+    if not keep_list:
+        raise RuntimeError("剪枝后无剩余通道")
+    dev = linears[0][1].weight.device
+    keep = torch.tensor(keep_list, dtype=torch.long, device=dev)
+
+    for li, (n, lin) in enumerate(linears):
+        W = lin.weight.data
+        b = lin.bias.data if lin.bias is not None else None
+        if li == 0:
+            Wn = W.index_select(0, keep)
+            bn = b.index_select(0, keep) if b is not None else None
+        else:
+            Wn = W.index_select(1, keep).index_select(0, keep)
+            bn = b.index_select(0, keep) if b is not None else None
+        lin.weight = nn.Parameter(Wn.contiguous().clone())
+        if bn is not None:
+            lin.bias = nn.Parameter(bn.contiguous().clone())
+        lin.out_features = Wn.shape[0]
+        lin.in_features = Wn.shape[1]
+
+        norm_name = n.replace("linear", "norm")
+        norm = getattr(mlp.layers, norm_name)
+        if isinstance(norm, nn.RMSNorm):
+            nw = norm.weight.data.index_select(0, keep)
+            norm.weight = nn.Parameter(nw.contiguous().clone())
+            norm.normalized_shape = (len(keep_list),)
+
+    Wl = last.weight.data
+    Wln = Wl.index_select(1, keep)
+    last.weight = nn.Parameter(Wln.contiguous().clone())
+    last.in_features = Wln.shape[1]
+    last.out_features = Wln.shape[0]
 
 
-def _count_mlp_linears(mlp: nn.Module) -> int:
-    return sum(1 for m in mlp.layers if isinstance(m, nn.Linear))
+def _manual_prune_mlphead(head: nn.Module, prune_idxs: list[int]) -> None:
+    """``head`` 为 ``MLPHead``：含 ``.mlp`` 与 ``.last``。"""
+    _manual_neuron_prune_mlp_and_last(head.mlp, head.last, prune_idxs)
 
 
 def _assert_uniform_mlp_linears(mlp: nn.Module, tag: str) -> int:
-    """Dreamer 的 MLP 各隐藏层共用同一 ``units``；剪枝后所有 Linear 的 out_features 须一致。"""
     linears = [m for m in mlp.layers if isinstance(m, nn.Linear)]
     outs = [int(L.weight.shape[0]) for L in linears]
     if len(set(outs)) != 1:
-        raise RuntimeError(
-            f"{tag}: 剪枝后各 Linear 输出维不一致 {outs}，无法用单一 cfg.actor/critic.units 加载。"
-            "应对 actor_linear0..2（及 value）逐层用同一 pruning_idxs 剪输出通道组。"
-        )
+        raise RuntimeError(f"{tag}: 各 Linear 输出维不一致 {outs}")
     return outs[0]
 
 
-def _prune_mlp_head_pair(
-    live_mlp_last: nn.Sequential,
-    frozen_mlp_last: nn.Sequential,
-    dummy_feat: torch.Tensor,
-    pruning_idxs: list[int],
-    label: str,
-    group_name_substr: str,
-):
-    """在含 ``group_name_substr``（如 ``actor_linear1``）的依赖组上剪枝；live / frozen 各剪一次。"""
-    live_rg = [p.requires_grad for p in live_mlp_last.parameters()]
-    frozen_rg = [p.requires_grad for p in frozen_mlp_last.parameters()]
-    for p in live_mlp_last.parameters():
-        p.requires_grad_(True)
-    for p in frozen_mlp_last.parameters():
-        p.requires_grad_(True)
-    try:
-        dg = tp.DependencyGraph()
-        dg.build_dependency(
-            live_mlp_last,
-            example_inputs=dummy_feat,
-            customized_pruners={nn.RMSNorm: RMSNormPruningHandler()},
-        )
-        groups = list(dg.get_all_groups())
-        if len(groups) < 2:
-            raise RuntimeError(f"{label}: 依赖组不足 2 个，当前 len={len(groups)}")
-        gi = _group_index_for_linear(dg, group_name_substr)
-        print(f"    [{label}] 依赖组 index={gi} (匹配 {group_name_substr!r})")
-        groups[gi].prune(idxs=pruning_idxs)
-
-        dg_f = tp.DependencyGraph()
-        dg_f.build_dependency(
-            frozen_mlp_last,
-            example_inputs=dummy_feat,
-            customized_pruners={nn.RMSNorm: RMSNormPruningHandler()},
-        )
-        groups_f = list(dg_f.get_all_groups())
-        if len(groups_f) < 2:
-            raise RuntimeError(f"{label} (frozen): 依赖组不足 2 个")
-        gi_f = _group_index_for_linear(dg_f, group_name_substr)
-        groups_f[gi_f].prune(idxs=pruning_idxs)
-    finally:
-        for p, r in zip(live_mlp_last.parameters(), live_rg):
-            p.requires_grad_(r)
-        for p, r in zip(frozen_mlp_last.parameters(), frozen_rg):
-            p.requires_grad_(r)
-
-
-def _prune_all_heads_same_idxs(agent: Dreamer, dummy_feat: torch.Tensor, pruning_idxs: list[int]) -> None:
-    """对 Actor / Value / _slow 的每一层隐藏 Linear，用同一 ``pruning_idxs`` 剪输出通道（与单一 ``units`` 一致）。"""
-    n_a = _count_mlp_linears(agent.actor.mlp)
-    n_v = _count_mlp_linears(agent.value.mlp)
-    n_s = _count_mlp_linears(agent._slow_value.mlp)
-    if not (n_a == n_v == n_s):
-        raise RuntimeError(f"Actor / Value / _slow_value 的 MLP 层数不一致: {n_a}, {n_v}, {n_s}")
-    for li in range(n_a):
-        _prune_mlp_head_pair(
-            nn.Sequential(agent.actor.mlp, agent.actor.last),
-            nn.Sequential(agent._frozen_actor.mlp, agent._frozen_actor.last),
-            dummy_feat,
-            pruning_idxs,
-            f"actor_L{li}",
-            f"actor_linear{li}",
-        )
-        _prune_mlp_head_pair(
-            nn.Sequential(agent.value.mlp, agent.value.last),
-            nn.Sequential(agent._frozen_value.mlp, agent._frozen_value.last),
-            dummy_feat,
-            pruning_idxs,
-            f"value_L{li}",
-            f"value_linear{li}",
-        )
-        _prune_mlp_head_pair(
-            nn.Sequential(agent._slow_value.mlp, agent._slow_value.last),
-            nn.Sequential(agent._frozen_slow_value.mlp, agent._frozen_slow_value.last),
-            dummy_feat,
-            pruning_idxs,
-            f"_slow_L{li}",
-            f"value_linear{li}",
-        )
-
-
 def prune_actor_critic(agent: Dreamer, importance: torch.Tensor, prune_ratio: float) -> Dreamer:
-    """按合并重要性剪枝：Actor、Value、_slow_value 及其 frozen 镜像（第一层隐藏宽度一致）。"""
+    """Actor / Value / _slow 及 frozen 镜像：同一 ``prune_idxs`` 手动同步剪枝。"""
     n_neurons = len(importance)
     n_prune = int(n_neurons * prune_ratio)
     n_keep = n_neurons - n_prune
@@ -248,18 +203,24 @@ def prune_actor_critic(agent: Dreamer, importance: torch.Tensor, prune_ratio: fl
     print(f"  总神经元: {n_neurons}, 剪掉: {n_prune}, 保留: {n_keep}")
     print(f"  被删神经元中最高重要性: {importance[sorted_indices[n_prune - 1]].item():.4f}")
     print(f"  被保留神经元中最低重要性: {importance[sorted_indices[n_prune]].item():.4f}")
+    print("  使用手动同构剪枝（index_select，不依赖 torch_pruning 依赖组）...")
 
-    feat_size = agent.rssm.feat_size
-    dummy_feat = torch.zeros(1, feat_size, device=agent.device)
-
-    _prune_all_heads_same_idxs(agent, dummy_feat, pruning_idxs)
+    for h in (
+        agent.actor,
+        agent._frozen_actor,
+        agent.value,
+        agent._frozen_value,
+        agent._slow_value,
+        agent._frozen_slow_value,
+    ):
+        _manual_prune_mlphead(h, pruning_idxs)
 
     ua = _assert_uniform_mlp_linears(agent.actor.mlp, "actor.mlp")
     uv = _assert_uniform_mlp_linears(agent.value.mlp, "value.mlp")
     us = _assert_uniform_mlp_linears(agent._slow_value.mlp, "_slow_value.mlp")
     if not (ua == uv == us):
         raise RuntimeError(f"Actor/Value/_slow_value 隐藏宽度不一致: {ua}, {uv}, {us}")
-    print(f"  剪枝后各隐藏层统一 units = {ua} (actor / value / _slow_value 已对齐)")
+    print(f"  剪枝后各隐藏层统一 units = {ua}")
     return agent
 
 
