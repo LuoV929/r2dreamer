@@ -43,24 +43,34 @@ HYDRA_OVERRIDES = [
     "buffer.storage_device=cpu",
 ]
 
+# 重要性估计：单独 (B,T)，避免 _cal_grad 反传 OOM。仍用完整损失图，仅缩小 slice。
+# 若仍 OOM，改为 (2, 8) 或 (4, 8)，或减小 CALIB_N_BATCHES。
+CALIB_BATCH_SIZE = 4
+CALIB_BATCH_LENGTH = 16
+CALIB_N_BATCHES = 16
+
 
 def _build_cfg():
     with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
         return compose(config_name="configs", overrides=HYDRA_OVERRIDES)
 
 
-def collect_data_and_compute_importance(agent: Dreamer, cfg, train_envs, n_batches: int = 16):
-    """与 reward 脚本相同思路：小 buffer 采真实数据，多次 _cal_grad 累积梯度。"""
+def collect_data_and_compute_importance(agent: Dreamer, cfg, train_envs):
+    """小 buffer 采数据；用缩小的 (B,T) 多次 _cal_grad 累积梯度，降低单次反传显存。"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    bs, bl = CALIB_BATCH_SIZE, CALIB_BATCH_LENGTH
     small_buffer_cfg = OmegaConf.create({
-        "batch_size": cfg.batch_size,
-        "batch_length": cfg.batch_length,
-        "max_size": 2000,
+        "batch_size": bs,
+        "batch_length": bl,
+        "max_size": max(2000, bs * bl * 4),
         "device": str(cfg.device),
         "storage_device": "cpu",
     })
     replay_buffer = Buffer(small_buffer_cfg)
 
-    min_steps = cfg.batch_size * cfg.batch_length + 1
+    min_steps = bs * bl + 1
     agent_state = agent.get_initial_state(cfg.env.env_num)
     act = agent_state["prev_action"].clone()
     steps_collected = 0
@@ -86,13 +96,18 @@ def collect_data_and_compute_importance(agent: Dreamer, cfg, train_envs, n_batch
     agent.train()
     agent.zero_grad(set_to_none=True)
 
-    print(f"  累积 {n_batches} 个 batch 的梯度（_cal_grad 全损失反传）...")
-    for _ in range(n_batches):
+    print(
+        f"  累积 {CALIB_N_BATCHES} 个 batch 的梯度 "
+        f"(B={bs}, T={bl}，小于训练 batch 以降低显存)..."
+    )
+    for i in range(CALIB_N_BATCHES):
         data, index, initial = replay_buffer.sample()
         data = data.to(cfg.device)
         initial = (initial[0].to(cfg.device), initial[1].to(cfg.device))
         data = agent.preprocess(data)
         agent._cal_grad(data, initial)
+        if torch.cuda.is_available() and (i + 1) % 4 == 0:
+            torch.cuda.empty_cache()
 
     la = agent.actor.mlp.layers.actor_linear0
     lv = agent.value.mlp.layers.value_linear0
@@ -118,32 +133,44 @@ def _prune_mlp_head_pair(
     pruning_idxs: list[int],
     label: str,
 ):
-    """对 (mlp+last) 与对应的 frozen 副本用同一组 idxs 剪 Group 1。"""
-    dg = tp.DependencyGraph()
-    dg.build_dependency(
-        live_mlp_last,
-        example_inputs=dummy_feat,
-        customized_pruners={nn.RMSNorm: RMSNormPruningHandler()},
-    )
-    groups = list(dg.get_all_groups())
-    if len(groups) < 2:
-        raise RuntimeError(f"{label}: 依赖组不足 2 个，当前 len={len(groups)}")
-    groups[1].prune(idxs=pruning_idxs)
+    """对 (mlp+last) 与对应的 frozen 副本用同一组 idxs 剪 Group 1。
 
+    torch_pruning 对「全部为 requires_grad=False」的子图（如 _slow_value）建图时
+    可能只得到 1 个依赖组；建图前临时打开梯度标志，剪完再恢复。
+    """
+    live_rg = [p.requires_grad for p in live_mlp_last.parameters()]
+    frozen_rg = [p.requires_grad for p in frozen_mlp_last.parameters()]
+    for p in live_mlp_last.parameters():
+        p.requires_grad_(True)
     for p in frozen_mlp_last.parameters():
         p.requires_grad_(True)
-    dg_f = tp.DependencyGraph()
-    dg_f.build_dependency(
-        frozen_mlp_last,
-        example_inputs=dummy_feat,
-        customized_pruners={nn.RMSNorm: RMSNormPruningHandler()},
-    )
-    groups_f = list(dg_f.get_all_groups())
-    if len(groups_f) < 2:
-        raise RuntimeError(f"{label} (frozen): 依赖组不足 2 个")
-    groups_f[1].prune(idxs=pruning_idxs)
-    for p in frozen_mlp_last.parameters():
-        p.requires_grad_(False)
+    try:
+        dg = tp.DependencyGraph()
+        dg.build_dependency(
+            live_mlp_last,
+            example_inputs=dummy_feat,
+            customized_pruners={nn.RMSNorm: RMSNormPruningHandler()},
+        )
+        groups = list(dg.get_all_groups())
+        if len(groups) < 2:
+            raise RuntimeError(f"{label}: 依赖组不足 2 个，当前 len={len(groups)}")
+        groups[1].prune(idxs=pruning_idxs)
+
+        dg_f = tp.DependencyGraph()
+        dg_f.build_dependency(
+            frozen_mlp_last,
+            example_inputs=dummy_feat,
+            customized_pruners={nn.RMSNorm: RMSNormPruningHandler()},
+        )
+        groups_f = list(dg_f.get_all_groups())
+        if len(groups_f) < 2:
+            raise RuntimeError(f"{label} (frozen): 依赖组不足 2 个")
+        groups_f[1].prune(idxs=pruning_idxs)
+    finally:
+        for p, r in zip(live_mlp_last.parameters(), live_rg):
+            p.requires_grad_(r)
+        for p, r in zip(frozen_mlp_last.parameters(), frozen_rg):
+            p.requires_grad_(r)
 
 
 def prune_actor_critic(agent: Dreamer, importance: torch.Tensor, prune_ratio: float) -> Dreamer:
