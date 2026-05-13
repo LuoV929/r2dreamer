@@ -107,7 +107,8 @@ def main():
     cfg_backup = copy.deepcopy(cfg)
     train_envs, eval_envs, obs_space, act_space = make_envs(cfg.env)
 
-    prune_pcts = [30, 50, 70]
+    # prune_pcts = [30, 50, 70]
+    prune_pcts = [55, 60, 65]
 
     for pct in prune_pcts:
         print(f"\n{'=' * 60}\n微调 Actor+Critic 剪枝率 {pct}%\n{'=' * 60}")
