@@ -72,10 +72,22 @@ def load_pruned_agent(pruned_ckpt_path: pathlib.Path, cfg_backup, obs_space, act
     wv = state_dict["value.mlp.layers.value_linear0.weight"]
     ws = state_dict["_slow_value.mlp.layers.value_linear0.weight"]
     if wa.shape[0] != wv.shape[0] or wa.shape[0] != ws.shape[0]:
-        raise RuntimeError(f"Actor/Value/_slow_value 第一层 out 不一致: {wa.shape}, {wv.shape}, {ws.shape}")
+        raise RuntimeError(f"Actor/Value/_slow_value linear0 out 不一致: {wa.shape}, {wv.shape}, {ws.shape}")
 
-    actual_units = int(wa.shape[0])
-    print(f"  检测到第一层隐藏 units: {actual_units}")
+    # 必须与最后一层隐藏 linear2 的 out 一致（Hydra 单一 units）；旧脚本误剪 groups[1] 会导致 768/538 混宽
+    wa2 = state_dict["actor.mlp.layers.actor_linear2.weight"]
+    wv2 = state_dict["value.mlp.layers.value_linear2.weight"]
+    ws2 = state_dict["_slow_value.mlp.layers.value_linear2.weight"]
+    u0, u2 = int(wa.shape[0]), int(wa2.shape[0])
+    if u0 != u2 or int(wv.shape[0]) != int(wv2.shape[0]) or int(ws.shape[0]) != int(ws2.shape[0]):
+        raise RuntimeError(
+            "checkpoint 中 Actor/Value 各层隐藏宽度不一致（多为误用了依赖图 ``groups[1]``，"
+            "只剪到了靠近输出的层而 linear0 仍为 768）。请用更新后的 ``prune_actor_critic.py`` "
+            "重新剪枝并保存，再微调。"
+        )
+
+    actual_units = u0
+    print(f"  检测到统一隐藏 units: {actual_units} (linear0..linear2 一致)")
 
     cfg_model = copy.deepcopy(cfg_backup.model)
     cfg_model.actor.units = actual_units

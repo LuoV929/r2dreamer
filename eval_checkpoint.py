@@ -112,6 +112,20 @@ def load_agent(
     if wkey in state_dict:
         cfg_model.reward.units = int(state_dict[wkey].shape[0])
 
+    wa, wv = "actor.mlp.layers.actor_linear0.weight", "value.mlp.layers.value_linear0.weight"
+    wa2 = "actor.mlp.layers.actor_linear2.weight"
+    if wa in state_dict and wv in state_dict:
+        ua, uv = int(state_dict[wa].shape[0]), int(state_dict[wv].shape[0])
+        if ua != uv:
+            raise RuntimeError(f"Actor/Value first-hidden out mismatch: {ua} vs {uv}")
+        if wa2 in state_dict and int(state_dict[wa2].shape[0]) != ua:
+            raise RuntimeError(
+                "Actor MLP 各层隐藏宽度不一致，无法用单一 cfg.model.actor.units 构建 Dreamer。"
+                "请使用修正后的 prune_actor_critic 重新导出 checkpoint。"
+            )
+        cfg_model.actor.units = ua
+        cfg_model.critic.units = uv
+
     agent = Dreamer(cfg_model, obs_space, act_space).to(device)
     missing, unexpected = agent.load_state_dict(state_dict, strict=True)
     if missing or unexpected:
