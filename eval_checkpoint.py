@@ -21,6 +21,11 @@ Extra Hydra overrides (must come after ``--``)::
 
 Pruned reward checkpoints: ``reward.mlp.layers.reward_linear0`` out_features are read
 from the state dict and ``model.reward.units`` is set before building ``Dreamer``.
+
+RSSM + ConvDecoder pruned (``prune_rssm_decoder`` / ``finetune_pruned_rssm_decoder``):
+``rssm._obs_net.obs_net_0.weight`` 的第 0 维推断 ``H``，并设置 ``model.hidden``,
+``model.rssm.hidden``, ``model.decoder.cnn.units`` 为 ``H``（**不**改 ``model.units``，
+Actor/Encoder 等仍为原宽度）。
 """
 
 from __future__ import annotations
@@ -53,8 +58,17 @@ DEFAULT_OVERRIDES = [
 
 
 @torch.no_grad()
-def evaluate_once(agent, eval_envs) -> dict[str, float]:
-    """One eval round: each parallel env runs until its first episode ends."""
+def evaluate_once(
+    agent,
+    eval_envs,
+    max_steps_per_episode: int | None = None,
+) -> dict[str, float]:
+    """One eval round: each parallel env runs until its first episode ends.
+
+    If ``max_steps_per_episode`` is set, any env that exceeds this step count is
+    treated as finished (``done`` forced True) so a single degenerate trajectory
+    cannot dominate wall time and distort mean episode length.
+    """
     envs = eval_envs
     agent.eval()
     done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
@@ -66,12 +80,16 @@ def evaluate_once(agent, eval_envs) -> dict[str, float]:
     act = agent_state["prev_action"].clone()
 
     while not once_done.all():
-        steps += ~done * ~once_done
+        steps += (~done & ~once_done).to(torch.int32)
         act_cpu = act.detach().to("cpu")
         done_cpu = done.detach().to("cpu")
         trans_cpu, done_cpu = envs.step(act_cpu, done_cpu)
         trans = trans_cpu.to(agent.device, non_blocking=True)
         done = done_cpu.to(agent.device)
+
+        if max_steps_per_episode is not None:
+            over = (steps >= int(max_steps_per_episode)) & ~once_done
+            done = done | over
 
         trans["action"] = act
         act, agent_state = agent.act(trans, agent_state, eval=True)
@@ -80,12 +98,16 @@ def evaluate_once(agent, eval_envs) -> dict[str, float]:
 
     agent.train()
     rets = returns.detach().cpu()
+    lens = steps.detach().cpu().to(torch.float32)
     return {
         "mean_return": float(rets.mean()),
         "std_return": float(rets.std(unbiased=False)),
         "min_return": float(rets.min()),
         "max_return": float(rets.max()),
-        "mean_length": float(steps.to(torch.float32).mean()),
+        "mean_length": float(lens.mean()),
+        "min_length": float(lens.min()),
+        "max_length": float(lens.max()),
+        "length_std": float(lens.std(unbiased=False)),
         "num_episodes": int(envs.env_num),
     }
 
@@ -126,6 +148,28 @@ def load_agent(
         cfg_model.actor.units = ua
         cfg_model.critic.units = uv
 
+    # RSSM + CNN decoder 宽度剪枝：Hydra 默认 hidden 仍为 768，须与 checkpoint 对齐
+    k_obs = "rssm._obs_net.obs_net_0.weight"
+    if str(getattr(cfg_model, "rep_loss", "")) == "dreamer" and k_obs in state_dict:
+        H_ckpt = int(state_dict[k_obs].shape[0])
+        H_cfg = int(cfg_model.hidden) if hasattr(cfg_model, "hidden") else H_ckpt
+        if H_ckpt != H_cfg:
+            cfg_model.hidden = H_ckpt
+            if hasattr(cfg_model, "rssm") and hasattr(cfg_model.rssm, "hidden"):
+                cfg_model.rssm.hidden = H_ckpt
+            if hasattr(cfg_model, "decoder") and hasattr(cfg_model.decoder, "cnn"):
+                cfg_model.decoder.cnn.units = H_ckpt
+            k_dyn = "rssm._deter_net._dyn_in0.0.weight"
+            k_sp1 = "decoder._cnn.sp1.0.weight"
+            if k_dyn in state_dict and int(state_dict[k_dyn].shape[0]) != H_ckpt:
+                raise RuntimeError(
+                    f"RSSM dyn_in0 输出维 {state_dict[k_dyn].shape[0]} 与 obs_net 首层 {H_ckpt} 不一致"
+                )
+            if k_sp1 in state_dict and int(state_dict[k_sp1].shape[0]) != 2 * H_ckpt:
+                raise RuntimeError(
+                    f"decoder._cnn.sp1[0] 输出维 {state_dict[k_sp1].shape[0]} 与 2*H={2 * H_ckpt} 不一致"
+                )
+
     agent = Dreamer(cfg_model, obs_space, act_space).to(device)
     missing, unexpected = agent.load_state_dict(state_dict, strict=True)
     if missing or unexpected:
@@ -162,6 +206,13 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Override cfg.device (e.g. cuda:0). Defaults to Hydra config.",
     )
+    parser.add_argument(
+        "--max-eval-steps",
+        type=int,
+        default=None,
+        help="Force episode end after this many env steps per worker (Breakout default "
+        "time_limit can be ~27k; set e.g. 5000 to cap degenerate long episodes).",
+    )
     args, hydra_overrides = parser.parse_known_args(argv)
     if hydra_overrides and hydra_overrides[0] == "--":
         hydra_overrides = hydra_overrides[1:]
@@ -183,6 +234,8 @@ def main(argv: list[str] | None = None) -> None:
     episodes_per_round = eval_envs.env_num
 
     print(f"device={device}, eval_parallel_envs={episodes_per_round}, num_rounds={args.num_rounds}")
+    if args.max_eval_steps is not None:
+        print(f"max_eval_steps (forced episode cap)={args.max_eval_steps}")
     print(f"total_episodes ≈ {episodes_per_round * args.num_rounds}")
 
     for ckpt_str in args.checkpoints:
@@ -196,12 +249,14 @@ def main(argv: list[str] | None = None) -> None:
 
         all_means: list[float] = []
         for r in range(args.num_rounds):
-            m = evaluate_once(agent, eval_envs)
+            m = evaluate_once(agent, eval_envs, max_steps_per_episode=args.max_eval_steps)
             all_means.append(m["mean_return"])
             print(
                 f"  round {r + 1}/{args.num_rounds}: "
                 f"mean_return={m['mean_return']:.2f} "
-                f"(std_episode={m['std_return']:.2f}, len={m['mean_length']:.1f})"
+                f"(std_episode={m['std_return']:.2f}, "
+                f"len_mean={m['mean_length']:.1f}, len_min={m['min_length']:.0f}, "
+                f"len_max={m['max_length']:.0f}, len_std={m['length_std']:.1f})"
             )
 
         stacked = torch.tensor(all_means)
