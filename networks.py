@@ -196,13 +196,23 @@ class ConvEncoder(nn.Module):
         h, w, input_ch = input_shape
         self.depths = tuple(int(config.depth) * int(mult) for mult in list(config.mults))
         self.kernel_size = int(config.kernel_size)
+        # Optional: last conv output channels (for structured channel pruning). When set,
+        # must match checkpoint; ``out_dim`` uses this value instead of ``depths[-1]``.
+        last_override = getattr(config, "last_out_channels", None)
+        if last_override is not None:
+            last_override = int(last_override)
         in_dim = input_ch
         layers = []
+        last_out_ch = None
         for i, depth in enumerate(self.depths):
+            out_ch = depth
+            if i == len(self.depths) - 1 and last_override is not None:
+                out_ch = last_override
+            last_out_ch = out_ch
             layers.append(
                 Conv2dSamePad(
                     in_channels=in_dim,
-                    out_channels=depth,
+                    out_channels=out_ch,
                     kernel_size=self.kernel_size,
                     stride=1,
                     bias=True,
@@ -210,12 +220,13 @@ class ConvEncoder(nn.Module):
             )
             layers.append(nn.MaxPool2d(2, 2))
             if config.norm:
-                layers.append(RMSNorm2D(depth, eps=1e-04, dtype=torch.float32))
+                layers.append(RMSNorm2D(out_ch, eps=1e-04, dtype=torch.float32))
             layers.append(act())
-            in_dim = depth
+            in_dim = out_ch
             h, w = h // 2, w // 2
 
-        self.out_dim = self.depths[-1] * h * w
+        assert last_out_ch is not None
+        self.out_dim = int(last_out_ch) * h * w
         self.layers = nn.Sequential(*layers)
 
     def forward(self, obs):

@@ -26,6 +26,11 @@ RSSM + ConvDecoder pruned (``prune_rssm_decoder`` / ``finetune_pruned_rssm_decod
 ``rssm._obs_net.obs_net_0.weight`` 的第 0 维推断 ``H``，并设置 ``model.hidden``,
 ``model.rssm.hidden``, ``model.decoder.cnn.units`` 为 ``H``（**不**改 ``model.units``，
 Actor/Encoder 等仍为原宽度）。
+
+Encoder CNN 末层通道剪枝（``prune_encoder`` / ``finetune_pruned_encoder``）：从
+``state_dict`` 中 ``encoder.encoders.0.layers.*`` 最后一层 4D 卷积权重的输出通道数推断
+``last_out_channels``，并通过 ``open_dict`` 写入 ``model.encoder.cnn.last_out_channels``，
+使 ``ConvEncoder`` 与 checkpoint 对齐。
 """
 
 from __future__ import annotations
@@ -33,11 +38,12 @@ from __future__ import annotations
 import argparse
 import copy
 import pathlib
+import re
 import sys
 
 import torch
 from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 import tools
 from dreamer import Dreamer
@@ -130,6 +136,27 @@ def load_agent(
             state_dict[key] = t.float()
 
     cfg_model = copy.deepcopy(cfg.model)
+
+    # Encoder CNN 末层通道剪枝：与默认 depth*mults[-1] 不一致时写入 last_out_channels
+    _last_layer_idx = -1
+    _last_conv_c: int | None = None
+    for _k, _t in state_dict.items():
+        if not isinstance(_t, torch.Tensor) or _t.dim() != 4:
+            continue
+        _m = re.match(r"encoder\.encoders\.0\.layers\.(\d+)\.weight$", _k)
+        if not _m:
+            continue
+        _li = int(_m.group(1))
+        if _li > _last_layer_idx:
+            _last_layer_idx = _li
+            _last_conv_c = int(_t.shape[0])
+    if _last_conv_c is not None:
+        _ec = cfg_model.encoder.cnn
+        _c_def = int(_ec.depth) * int(list(_ec.mults)[-1])
+        if _last_conv_c != _c_def:
+            with open_dict(_ec):
+                _ec.last_out_channels = _last_conv_c
+
     wkey = "reward.mlp.layers.reward_linear0.weight"
     if wkey in state_dict:
         cfg_model.reward.units = int(state_dict[wkey].shape[0])
