@@ -122,7 +122,8 @@ def main():
 
     # 与 prune_rssm_decoder 保存名 ``rssm_decoder_pruned_{pct}pct.pt`` 对齐（pct = int(ratio*100)）
     # prune_pcts = [30, 50, 70]
-    prune_pcts = [55, 60, 65, 75]
+    # prune_pcts = [55, 60, 65, 75]
+    prune_pcts = [60, 65]
 
     for pct in prune_pcts:
         print(f"\n{'=' * 60}\n微调 RSSM+Decoder 剪枝率 {pct}%\n{'=' * 60}")
