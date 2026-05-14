@@ -116,7 +116,7 @@ def main():
     train_envs, eval_envs, obs_space, act_space = make_envs(cfg.env)
 
     # prune_pcts = [30, 50, 70]
-    prune_pcts = [80, 85, 90, 95]
+    prune_pcts = [50, 80, 85, 90, 95]
 
     for pct in prune_pcts:
         print(f"\n{'=' * 60}\n微调 Encoder 剪枝率 {pct}%\n{'=' * 60}")
