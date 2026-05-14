@@ -308,7 +308,8 @@ def main():
     train_envs, eval_envs, obs_space, act_space = make_envs(cfg.env)
     act_dim = act_space.n if hasattr(act_space, "n") else int(sum(act_space.shape))
 
-    prune_ratios = [0.3, 0.5, 0.7]
+    # prune_ratios = [0.3, 0.5, 0.7]
+    prune_ratios = [0.8, 0.85, 0.9, 0.95]
 
     for prune_ratio in prune_ratios:
         print(f"\n{'=' * 60}\nEncoder 通道剪枝率: {prune_ratio * 100:.0f}%\n{'=' * 60}")
